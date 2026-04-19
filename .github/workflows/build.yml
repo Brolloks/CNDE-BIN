@@ -1,0 +1,58 @@
+name: Build cardano-address ARM64
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install GHC
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.6.7'
+          cabal-version: 'latest'
+
+      - name: Install static libs
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libsodium-dev \
+            libgmp-dev \
+            zlib1g-dev \
+            libnuma-dev
+
+      - name: Clone cardano-addresses
+        run: |
+          git clone --depth 1 --branch 4.0.1 \
+            https://github.com/IntersectMBO/cardano-addresses.git
+
+      - name: Configure static build
+        run: |
+          cat > cardano-addresses/cabal.project.local << 'EOF'
+          package *
+            ghc-options: -split-sections
+          executable-static: True
+          EOF
+
+      - name: Build static binary
+        run: |
+          cd cardano-addresses
+          cabal update
+          cabal build exe:cardano-address \
+            --enable-executable-static \
+            --enable-executable-stripping \
+            --jobs=2
+
+      - name: Verify and copy binary
+        run: |
+          BINARY=$(find cardano-addresses/dist-newstyle \
+            -name "cardano-address" -type f \
+            | grep -v "\.dyn" | head -1)
+          echo "Found: $BINARY"
+          file "$BINARY"
+          ldd "$BINARY" || true
+          cp "$BINARY" ./cardano-address-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardano-address-aarch64
+          path: ./cardano-address-aarch64
