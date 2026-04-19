@@ -1,5 +1,5 @@
 name: Build cardano-address ARM64
-on: [push]
+on: [manual]
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
