@@ -120,19 +120,17 @@ if [[ "${VERIFY_ADDRESS}" == *"PASTE_A_KNOWN"* ]]; then
     die "VERIFY_ADDRESS is still the placeholder. Set it to a real address from your wallet."
 fi
 
-# ─── Detect address type from VERIFY_ADDRESS ──────────────────────────────────
-# A base address (payment + stake) starts with addr1q on mainnet or addr_test1q on testnet.
-# An enterprise address (payment only) starts with addr1v on mainnet or addr_test1v on testnet.
-# We auto-detect which to derive so verification always matches.
+# ─── Detect address type from VERIFY_ADDRESS prefix ──────────────────────────
+# Base address    (payment + stake): addr1q...  / addr_test1q...
+# Enterprise addr (payment only):    addr1v...  / addr_test1v...
 if [[ "${VERIFY_ADDRESS}" == addr1q* || "${VERIFY_ADDRESS}" == addr_test1q* ]]; then
     ADDRESS_TYPE="base"
 elif [[ "${VERIFY_ADDRESS}" == addr1v* || "${VERIFY_ADDRESS}" == addr_test1v* ]]; then
     ADDRESS_TYPE="enterprise"
 else
-    # Default to base — most wallets use base addresses
     ADDRESS_TYPE="base"
     warn "Could not auto-detect address type from prefix — defaulting to base address."
-    warn "If verification fails, check your VERIFY_ADDRESS is correct."
+    warn "If verification fails, check your VERIFY_ADDRESS is a valid mainnet/testnet address."
 fi
 
 info "Detected address type: ${ADDRESS_TYPE}"
@@ -199,7 +197,6 @@ ACCT_PRV="${TEMP_DIR}/acct.prv"
 PAYMENT_PRV="${TEMP_DIR}/payment.prv"
 PAYMENT_PUB="${TEMP_DIR}/payment.pub"
 STAKE_PRV="${TEMP_DIR}/stake.prv"
-STAKE_PUB="${TEMP_DIR}/stake.pub"
 
 OUT_SKEY="${OUTPUT_DIR}/payment_account${ACCOUNT_INDEX}.skey"
 OUT_VKEY="${OUTPUT_DIR}/payment_account${ACCOUNT_INDEX}.vkey"
@@ -270,9 +267,9 @@ rm -f /tmp/cardano_extract_err
 chmod 600 "${PAYMENT_PUB}"
 success "Payment key pair derived."
 
-# ─── Step 4: Stake key derivation (for base address verification) ─────────────
-# NOTE: acct.prv is kept alive until BOTH payment and stake keys are derived.
-# It is shredded at the end of this step.
+# ─── Step 4: Stake key derivation (required for base address verification) ────
+# acct.prv is kept alive until BOTH payment and stake keys are derived.
+# It is shredded at the end of this step only.
 if [[ "${ADDRESS_TYPE}" == "base" ]]; then
     info "Step 4/6 — Deriving stake key (role 2, index 0) for base address..."
 
@@ -284,40 +281,50 @@ if [[ "${ADDRESS_TYPE}" == "base" ]]; then
     fi
     rm -f /tmp/cardano_extract_err
     chmod 600 "${STAKE_PRV}"
-
-    if ! "${CARDANO_ADDRESS_BIN}" key public --with-chain-code \
-        < "${STAKE_PRV}" > "${STAKE_PUB}" 2>/tmp/cardano_extract_err; then
-        ERR=$(cat /tmp/cardano_extract_err)
-        rm -f /tmp/cardano_extract_err
-        die "Failed to derive stake public key. Error: ${ERR}"
-    fi
-    rm -f /tmp/cardano_extract_err
-    chmod 600 "${STAKE_PUB}"
-    success "Stake key pair derived."
+    success "Stake key derived."
 else
-    info "Step 4/6 — Skipping stake key derivation (enterprise address)."
+    info "Step 4/6 — Skipping stake key (enterprise address — no stake credential needed)."
 fi
 
-# Shred account key — both payment and stake keys now derived
+# Shred account key now that both payment and stake keys are derived
 "${SHRED_BIN}" ${SHRED_OPTS} "${ACCT_PRV}" 2>/dev/null || rm -f "${ACCT_PRV}"
 info "Account key securely deleted."
 
-# ─── Step 5: Verify address ───────────────────────────────────────────────────
+# ─── Step 5: Verify derived address matches expected address ──────────────────
 info "Step 5/6 — Verifying derived address matches expected address..."
 
 if [[ "${ADDRESS_TYPE}" == "base" ]]; then
-    # Build full base address: payment credential + stake credential combined
-    # This matches what wallets display (addr1q... on mainnet)
+    # Build full base address using the pattern from the official cardano-addresses README:
+    #
+    #   cat addr.prv \
+    #     | cardano-address key public --with-chain-code \
+    #     | cardano-address address payment --network-tag mainnet \
+    #     | cardano-address address delegation $(cat stake.prv | cardano-address key public --with-chain-code)
+    #
+    # The stake public key is derived INLINE as the argument to address delegation.
+    # The payment address flows through stdin.
+    # This avoids the broken pipe that occurs when passing a pre-saved pub key file.
+
+    STAKE_PUB_INLINE=$("${CARDANO_ADDRESS_BIN}" key public --with-chain-code < "${STAKE_PRV}" 2>/tmp/cardano_extract_err)
+    if [[ -z "${STAKE_PUB_INLINE}" ]]; then
+        ERR=$(cat /tmp/cardano_extract_err 2>/dev/null)
+        rm -f /tmp/cardano_extract_err
+        die "Failed to derive stake public key inline. Error: ${ERR}"
+    fi
+    rm -f /tmp/cardano_extract_err
+
     DERIVED_ADDRESS=$(
-        "${CARDANO_ADDRESS_BIN}" address payment \
+        "${CARDANO_ADDRESS_BIN}" key public --with-chain-code \
+            < "${PAYMENT_PRV}" \
+        | "${CARDANO_ADDRESS_BIN}" address payment \
             --network-tag "${NETWORK}" \
-            < "${PAYMENT_PUB}" \
         | "${CARDANO_ADDRESS_BIN}" address delegation \
-            < "${STAKE_PUB}" \
+            "${STAKE_PUB_INLINE}" \
         2>/tmp/cardano_extract_err || true
     )
+
 else
-    # Enterprise address: payment credential only (addr1v... on mainnet)
+    # Enterprise address: payment credential only (no stake)
     DERIVED_ADDRESS=$(
         "${CARDANO_ADDRESS_BIN}" address payment \
             --network-tag "${NETWORK}" \
