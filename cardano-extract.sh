@@ -7,6 +7,8 @@
 #   ./cardano-extract.sh [--env /path/to/cardano-extract.env]
 #
 # Default env file: ./cardano-extract.env (same directory as script)
+#
+# IMPORTANT: Run this on an offline / air-gapped machine only.
 # =============================================================================
 
 set -euo pipefail
@@ -22,24 +24,24 @@ warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 die()     { error "$*"; cleanup; exit 1; }
 
-# ─── Cleanup — securely wipe temp directory ───────────────────────────────────
-TEMP_DIR=""   # will be set after env load
+# ─── Cleanup — securely wipe entire temp directory on exit ───────────────────
+TEMP_DIR=""  # set after env load
 
 cleanup() {
     if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
         warn "Securely deleting all temporary key material in ${TEMP_DIR} ..."
-        # Shred every file in the temp dir
         find "${TEMP_DIR}" -type f | while read -r f; do
-            "${SHRED_BIN}" ${SHRED_OPTS} "${f}" 2>/dev/null \
+            "${SHRED_BIN:-shred}" ${SHRED_OPTS:--u -z -n 3} "${f}" 2>/dev/null \
                 && info "  Shredded: ${f}" \
-                || warn "  shred failed for ${f} — falling back to rm"
+                || { warn "  shred failed for ${f} — falling back to rm"; rm -f "${f}"; }
         done
         rm -rf "${TEMP_DIR}"
         success "Temp directory removed."
     fi
+    rm -f /tmp/cardano_extract_err
 }
 
-# Always cleanup on exit (success or failure)
+# Always run cleanup on any exit — success, failure or Ctrl+C
 trap cleanup EXIT
 
 # ─── Parse arguments ──────────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
     die "Env file not found: ${ENV_FILE}"
 fi
 
-# Check permissions on env file — warn if world/group readable
+# Warn if env file is world/group readable
 ENV_PERMS=$(stat -c "%a" "${ENV_FILE}")
 if [[ "${ENV_PERMS}" != "600" && "${ENV_PERMS}" != "400" ]]; then
     warn "Env file permissions are ${ENV_PERMS}. Recommended: 600"
@@ -78,7 +80,7 @@ fi
 # shellcheck source=/dev/null
 source "${ENV_FILE}"
 
-# ─── Validate required vars ───────────────────────────────────────────────────
+# ─── Validate required variables ──────────────────────────────────────────────
 check_var() {
     local var_name="$1"
     local var_val="${!var_name}"
@@ -93,12 +95,12 @@ for VAR in SEED_PHRASE ACCOUNT_INDEX ADDRESS_INDEX WALLET_TYPE NETWORK \
     check_var "${VAR}"
 done
 
-# Validate ACCOUNT_INDEX is a non-negative integer
+# Validate ACCOUNT_INDEX
 if ! [[ "${ACCOUNT_INDEX}" =~ ^[0-9]+$ ]]; then
     die "ACCOUNT_INDEX must be a non-negative integer. Got: ${ACCOUNT_INDEX}"
 fi
 
-# Validate ADDRESS_INDEX is a non-negative integer
+# Validate ADDRESS_INDEX
 if ! [[ "${ADDRESS_INDEX}" =~ ^[0-9]+$ ]]; then
     die "ADDRESS_INDEX must be a non-negative integer. Got: ${ADDRESS_INDEX}"
 fi
@@ -118,6 +120,23 @@ if [[ "${VERIFY_ADDRESS}" == *"PASTE_A_KNOWN"* ]]; then
     die "VERIFY_ADDRESS is still the placeholder. Set it to a real address from your wallet."
 fi
 
+# ─── Detect address type from VERIFY_ADDRESS ──────────────────────────────────
+# A base address (payment + stake) starts with addr1q on mainnet or addr_test1q on testnet.
+# An enterprise address (payment only) starts with addr1v on mainnet or addr_test1v on testnet.
+# We auto-detect which to derive so verification always matches.
+if [[ "${VERIFY_ADDRESS}" == addr1q* || "${VERIFY_ADDRESS}" == addr_test1q* ]]; then
+    ADDRESS_TYPE="base"
+elif [[ "${VERIFY_ADDRESS}" == addr1v* || "${VERIFY_ADDRESS}" == addr_test1v* ]]; then
+    ADDRESS_TYPE="enterprise"
+else
+    # Default to base — most wallets use base addresses
+    ADDRESS_TYPE="base"
+    warn "Could not auto-detect address type from prefix — defaulting to base address."
+    warn "If verification fails, check your VERIFY_ADDRESS is correct."
+fi
+
+info "Detected address type: ${ADDRESS_TYPE}"
+
 # ─── Banner ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}============================================================${RESET}"
@@ -131,6 +150,7 @@ echo -e "  ${BOLD}Wallet type:${RESET}    ${WALLET_TYPE}"
 echo -e "  ${BOLD}Network:${RESET}        ${NETWORK}"
 echo -e "  ${BOLD}Account index:${RESET}  ${ACCOUNT_INDEX}  (UI Account $((ACCOUNT_INDEX + 1)))"
 echo -e "  ${BOLD}Address index:${RESET}  ${ADDRESS_INDEX}"
+echo -e "  ${BOLD}Address type:${RESET}   ${ADDRESS_TYPE}"
 echo -e "  ${BOLD}Output dir:${RESET}     ${OUTPUT_DIR}"
 echo -e "  ${BOLD}Verify address:${RESET} ${VERIFY_ADDRESS}"
 echo ""
@@ -157,14 +177,14 @@ if [[ ! -x "${SHRED_BIN}" ]]; then
 fi
 success "shred:           ${SHRED_BIN}"
 
-# ─── Validate seed phrase word count ─────────────────────────────────────────
+# ─── Validate seed phrase word count ──────────────────────────────────────────
 WORD_COUNT=$(echo "${SEED_PHRASE}" | wc -w)
 if [[ "${WORD_COUNT}" -ne 24 && "${WORD_COUNT}" -ne 15 ]]; then
     die "Seed phrase must be 15 or 24 words. Got ${WORD_COUNT} words."
 fi
 info "Seed phrase word count: ${WORD_COUNT} words ✓"
 
-# ─── Create temp and output directories ───────────────────────────────────────
+# ─── Create directories ───────────────────────────────────────────────────────
 mkdir -p "${TEMP_DIR}"
 chmod 700 "${TEMP_DIR}"
 info "Temp directory created: ${TEMP_DIR}"
@@ -178,13 +198,15 @@ ROOT_PRV="${TEMP_DIR}/root.prv"
 ACCT_PRV="${TEMP_DIR}/acct.prv"
 PAYMENT_PRV="${TEMP_DIR}/payment.prv"
 PAYMENT_PUB="${TEMP_DIR}/payment.pub"
+STAKE_PRV="${TEMP_DIR}/stake.prv"
+STAKE_PUB="${TEMP_DIR}/stake.pub"
 
 OUT_SKEY="${OUTPUT_DIR}/payment_account${ACCOUNT_INDEX}.skey"
 OUT_VKEY="${OUTPUT_DIR}/payment_account${ACCOUNT_INDEX}.vkey"
 
 # ─── Step 1: Root key from seed phrase ────────────────────────────────────────
 echo ""
-info "Step 1/5 — Deriving root key from seed phrase..."
+info "Step 1/6 — Deriving root key from seed phrase..."
 
 if ! echo "${SEED_PHRASE}" \
     | "${CARDANO_ADDRESS_BIN}" key from-recovery-phrase "${WALLET_TYPE}" \
@@ -202,7 +224,7 @@ chmod 600 "${ROOT_PRV}"
 success "Root key derived."
 
 # ─── Step 2: Account key derivation ───────────────────────────────────────────
-info "Step 2/5 — Deriving account key (index ${ACCOUNT_INDEX})..."
+info "Step 2/6 — Deriving account key (index ${ACCOUNT_INDEX})..."
 
 if [[ "${WALLET_TYPE}" == "Shelley" ]]; then
     ACCT_PATH="1852H/1815H/${ACCOUNT_INDEX}H"
@@ -210,7 +232,7 @@ else
     ACCT_PATH="44H/1815H/${ACCOUNT_INDEX}H"
 fi
 
-info "  Derivation path: m/${ACCT_PATH}/0/${ADDRESS_INDEX}"
+info "  Derivation path: m/${ACCT_PATH}"
 
 if ! "${CARDANO_ADDRESS_BIN}" key child "${ACCT_PATH}" \
     < "${ROOT_PRV}" > "${ACCT_PRV}" 2>/tmp/cardano_extract_err; then
@@ -222,12 +244,12 @@ rm -f /tmp/cardano_extract_err
 chmod 600 "${ACCT_PRV}"
 success "Account key derived (path: m/${ACCT_PATH})."
 
-# Immediately shred root key — no longer needed
+# Shred root key immediately — no longer needed
 "${SHRED_BIN}" ${SHRED_OPTS} "${ROOT_PRV}" 2>/dev/null || rm -f "${ROOT_PRV}"
-info "Root key securely deleted (no longer needed)."
+info "Root key securely deleted."
 
 # ─── Step 3: Payment key derivation ───────────────────────────────────────────
-info "Step 3/5 — Deriving payment key (role 0, address ${ADDRESS_INDEX})..."
+info "Step 3/6 — Deriving payment key (role 0, address ${ADDRESS_INDEX})..."
 
 if ! "${CARDANO_ADDRESS_BIN}" key child "0/${ADDRESS_INDEX}" \
     < "${ACCT_PRV}" > "${PAYMENT_PRV}" 2>/tmp/cardano_extract_err; then
@@ -242,21 +264,67 @@ if ! "${CARDANO_ADDRESS_BIN}" key public --with-chain-code \
     < "${PAYMENT_PRV}" > "${PAYMENT_PUB}" 2>/tmp/cardano_extract_err; then
     ERR=$(cat /tmp/cardano_extract_err)
     rm -f /tmp/cardano_extract_err
-    die "Failed to derive public key. Error: ${ERR}"
+    die "Failed to derive payment public key. Error: ${ERR}"
 fi
 rm -f /tmp/cardano_extract_err
 chmod 600 "${PAYMENT_PUB}"
+success "Payment key pair derived."
 
-# Shred account key — no longer needed
+# ─── Step 4: Stake key derivation (for base address verification) ─────────────
+# NOTE: acct.prv is kept alive until BOTH payment and stake keys are derived.
+# It is shredded at the end of this step.
+if [[ "${ADDRESS_TYPE}" == "base" ]]; then
+    info "Step 4/6 — Deriving stake key (role 2, index 0) for base address..."
+
+    if ! "${CARDANO_ADDRESS_BIN}" key child "2/0" \
+        < "${ACCT_PRV}" > "${STAKE_PRV}" 2>/tmp/cardano_extract_err; then
+        ERR=$(cat /tmp/cardano_extract_err)
+        rm -f /tmp/cardano_extract_err
+        die "Failed to derive stake key. Error: ${ERR}"
+    fi
+    rm -f /tmp/cardano_extract_err
+    chmod 600 "${STAKE_PRV}"
+
+    if ! "${CARDANO_ADDRESS_BIN}" key public --with-chain-code \
+        < "${STAKE_PRV}" > "${STAKE_PUB}" 2>/tmp/cardano_extract_err; then
+        ERR=$(cat /tmp/cardano_extract_err)
+        rm -f /tmp/cardano_extract_err
+        die "Failed to derive stake public key. Error: ${ERR}"
+    fi
+    rm -f /tmp/cardano_extract_err
+    chmod 600 "${STAKE_PUB}"
+    success "Stake key pair derived."
+else
+    info "Step 4/6 — Skipping stake key derivation (enterprise address)."
+fi
+
+# Shred account key — both payment and stake keys now derived
 "${SHRED_BIN}" ${SHRED_OPTS} "${ACCT_PRV}" 2>/dev/null || rm -f "${ACCT_PRV}"
-info "Account key securely deleted (no longer needed)."
-success "Payment signing and verification keys derived."
+info "Account key securely deleted."
 
-# ─── Step 4: Verify address ───────────────────────────────────────────────────
-info "Step 4/5 — Verifying derived address matches expected address..."
+# ─── Step 5: Verify address ───────────────────────────────────────────────────
+info "Step 5/6 — Verifying derived address matches expected address..."
 
-DERIVED_ADDRESS=$("${CARDANO_ADDRESS_BIN}" address payment \
-    --network-tag "${NETWORK}" < "${PAYMENT_PUB}" 2>/tmp/cardano_extract_err || true)
+if [[ "${ADDRESS_TYPE}" == "base" ]]; then
+    # Build full base address: payment credential + stake credential combined
+    # This matches what wallets display (addr1q... on mainnet)
+    DERIVED_ADDRESS=$(
+        "${CARDANO_ADDRESS_BIN}" address payment \
+            --network-tag "${NETWORK}" \
+            < "${PAYMENT_PUB}" \
+        | "${CARDANO_ADDRESS_BIN}" address delegation \
+            < "${STAKE_PUB}" \
+        2>/tmp/cardano_extract_err || true
+    )
+else
+    # Enterprise address: payment credential only (addr1v... on mainnet)
+    DERIVED_ADDRESS=$(
+        "${CARDANO_ADDRESS_BIN}" address payment \
+            --network-tag "${NETWORK}" \
+            < "${PAYMENT_PUB}" \
+        2>/tmp/cardano_extract_err || true
+    )
+fi
 
 if [[ -z "${DERIVED_ADDRESS}" ]]; then
     ERR=$(cat /tmp/cardano_extract_err 2>/dev/null)
@@ -273,12 +341,14 @@ echo ""
 if [[ "${DERIVED_ADDRESS}" != "${VERIFY_ADDRESS}" ]]; then
     error "ADDRESS MISMATCH!"
     error "The derived address does NOT match your expected address."
+    error ""
     error "Possible causes:"
     error "  - Wrong ACCOUNT_INDEX (try 0, 1, 2, 3...)"
     error "  - Wrong ADDRESS_INDEX (try 0, 1, 2...)"
     error "  - Wrong WALLET_TYPE (Shelley vs Byron)"
     error "  - Wrong NETWORK (mainnet vs testnet)"
     error "  - Incorrect VERIFY_ADDRESS pasted"
+    error "  - Address type mismatch (base vs enterprise)"
     error ""
     error "All temporary files will be securely deleted. Aborting."
     exit 1
@@ -286,8 +356,8 @@ fi
 
 success "Address verified! ✓ The derived key matches your wallet."
 
-# ─── Step 5: Convert to cardano-cli skey/vkey format ─────────────────────────
-info "Step 5/5 — Converting to cardano-cli skey/vkey format..."
+# ─── Step 6: Convert to cardano-cli skey/vkey format ─────────────────────────
+info "Step 6/6 — Converting to cardano-cli skey/vkey format..."
 
 if ! "${CARDANO_CLI_BIN}" key convert-cardano-address-key \
     --shelley-payment-key \
@@ -322,13 +392,10 @@ echo -e "  ${BOLD}Signing key (skey):${RESET}       ${OUT_SKEY}"
 echo -e "  ${BOLD}Verification key (vkey):${RESET}  ${OUT_VKEY}"
 echo ""
 warn "Reminder: Your skey is your private key. Keep it secure."
-warn "Delete the skey from this machine once you have transferred it"
-warn "to cold storage or wherever you need it."
+warn "Delete the skey from this machine once transferred to"
+warn "cold storage or wherever you need it."
 warn ""
 warn "To securely delete after use:"
 warn "  shred -u -z -n 3 \"${OUT_SKEY}\""
 echo ""
-
-# Cleanup of TEMP_DIR is handled automatically by the EXIT trap
-# (payment.prv and payment.pub in temp are wiped there)
 info "Cleaning up remaining temp files via EXIT trap..."
